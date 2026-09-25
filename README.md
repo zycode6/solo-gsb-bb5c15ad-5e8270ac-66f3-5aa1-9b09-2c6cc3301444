@@ -49,6 +49,12 @@
 并在库存内选择满足需求且**原纸总面积最小**的组合（面积并列时依次比超产最少、按输入顺序的用量字典序最小），
 返回各规格用量、单张出数、总产量与余量；库存满负荷仍无法满足需求时返回明确的 422。
 
+还提供**骑马订爬移补偿**接口 `/api/v1/impose/creep-plan`：沿用机台版面的全部参数，另收单张纸厚度
+`thickness_mm`（正有限数），按帖独立计算爬移——最外张位移为 0，向内第 `n` 张爬移量为
+`2 × (n−1) × thickness_mm`，该张正反面左右页位的图像均向纸面折缝中心平移该量；逐页位返回页码、
+纸面水平位移与按页位 0°/180° 旋转换算的阅读方向稿件水平位移，空白页位保留且位移为 0；
+任一张爬移量达到单页宽度时返回 422。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -96,6 +102,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 - 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 - 原纸备料接口：`POST http://localhost:8000/api/v1/impose/stock-plan`
+- 骑马订爬移补偿接口：`POST http://localhost:8000/api/v1/impose/creep-plan`
 
 ## 接口说明
 
@@ -950,6 +957,136 @@ curl -X POST http://localhost:8000/api/v1/impose/stock-plan \
   满负荷产能与总需求，例如
   `Value error, 库存原纸满负荷最多产出 30 张成品印张，无法满足总需求 100 张（每册 1 张 × 印数 100）`。
 
+## 骑马订爬移补偿（POST /api/v1/impose/creep-plan）
+
+骑马订装订时，内张纸包绕外张纸的书脊厚度会使内页图像在成品上向外（裁口侧）偏移，即**爬移**。
+本接口按帖独立计算各页位的爬移补偿量：把每张纸正反面左右页位的图像向**纸面折缝中心**平移，
+抵消装订后的偏移。页序、槽位与旋转规则完全沿用 `/api/v1/impose/press-layout`
+（左右装订与长/短边翻转均以机台版面的实际槽位和旋转角为准）。本地访问地址
+`http://localhost:8000/api/v1/impose/creep-plan`（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/creep-plan`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数） |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数；每帖最多容纳其 **4 倍**页数 |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_width_mm` | 数值 | 正数（有限值） | 单页宽度（mm） |
+| `page_height_mm` | 数值 | 正数（有限值） | 单页高度（mm） |
+| `gutter_mm` | 数值 | 非负数（有限值） | 中缝宽度（mm），允许为 `0` |
+| `duplex_flip` | 字符串 | `long` / `short` | 双面翻转：`long`=长边翻转，`short`=短边翻转 |
+| `thickness_mm` | 数值 | 正数（有限值） | 单张纸厚度（mm） |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/creep-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 8,
+    "max_sheets_per_signature": 4,
+    "binding": "left",
+    "page_width_mm": 100,
+    "page_height_mm": 200,
+    "gutter_mm": 0,
+    "duplex_flip": "long",
+    "thickness_mm": 0.1
+  }'
+```
+
+### 爬移计算规则
+
+- **按帖独立计算**：每帖最外张（张号 1）位移为 `0`，向内第 `n` 张的爬移量为
+  `creep = 2 × (n − 1) × thickness_mm`（每张纸在书脊处占两倍厚度的包绕量）；
+  各帖互不影响，内层帖从自己的最外张重新计 0。
+- **平移方向**：该张正反面左右页位的图像均向**纸面折缝中心**（纸面竖直中线）平移该量——
+  左槽（`x = 0`）向纸面右侧移，纸面水平位移为 `+creep`；右槽（`x = 页宽 + 中缝`）
+  向纸面左侧移，纸面水平位移为 `−creep`。位移方向只取决于槽位，与装订方向无关；
+  左右装订仅影响各槽位上的页码（沿用机台版面页序）。
+- **阅读方向稿件位移**：`artwork_shift_x_mm` 按页位旋转角换算——`0°`（正面与 `long`
+  背面）与纸面位移相同；`180°`（`short` 背面）取反。
+- **空白页位**：末帖补白的空白页位保留在结果中，`page` 为 `null`、两项位移均为 `0`。
+- **上限校验**：爬移量按**十进制尺寸**精确核算，任一张的爬移量**达到**单页宽度
+  （`creep ≥ page_width_mm`，含恰好相等）时返回 `422 Unprocessable Entity`，
+  错误信息指出帖号与张号。
+
+### 响应
+
+顶层回显请求参数与纸面尺寸（`paper_width_mm` / `paper_height_mm`）；按帖号
+`signature_index`、张号 `sheet_index`（从 1 开始，1 为最外张）逐张返回：
+
+- `creep_mm`：本张爬移量（最外张为 `0`）；
+- `front` / `back` 的 `left` / `right` 页位：`page`（页码，空白为 `null`）、
+  `paper_shift_x_mm`（纸面水平位移，正=向纸面右侧、负=向纸面左侧）、
+  `artwork_shift_x_mm`（阅读方向稿件水平位移）。
+
+上例（8 页单帖 2 张、页宽 100、纸厚 0.1，内张爬移 0.2）响应：
+
+```json
+{
+  "total_pages": 8,
+  "max_sheets_per_signature": 4,
+  "binding": "left",
+  "page_width_mm": 100.0,
+  "page_height_mm": 200.0,
+  "gutter_mm": 0.0,
+  "duplex_flip": "long",
+  "thickness_mm": 0.1,
+  "paper_width_mm": 200.0,
+  "paper_height_mm": 200.0,
+  "signature_count": 1,
+  "signatures": [
+    {
+      "signature_index": 1,
+      "sheet_count": 2,
+      "page_count_padded": 8,
+      "sheets": [
+        {
+          "sheet_index": 1,
+          "creep_mm": 0.0,
+          "front": {
+            "left":  { "page": 8, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0 },
+            "right": { "page": 1, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0 }
+          },
+          "back": {
+            "left":  { "page": 7, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0 },
+            "right": { "page": 2, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0 }
+          }
+        },
+        {
+          "sheet_index": 2,
+          "creep_mm": 0.2,
+          "front": {
+            "left":  { "page": 6, "paper_shift_x_mm": 0.2,  "artwork_shift_x_mm": 0.2 },
+            "right": { "page": 3, "paper_shift_x_mm": -0.2, "artwork_shift_x_mm": -0.2 }
+          },
+          "back": {
+            "left":  { "page": 5, "paper_shift_x_mm": 0.2,  "artwork_shift_x_mm": 0.2 },
+            "right": { "page": 4, "paper_shift_x_mm": -0.2, "artwork_shift_x_mm": -0.2 }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+同一请求若改为 `"duplex_flip": "short"`，背面保持槽位（背左 = 4、背右 = 5）且各页位
+旋转 `180°`，内张背面左槽为
+`{ "page": 4, "paper_shift_x_mm": 0.2, "artwork_shift_x_mm": -0.2 }`
+（纸面位移不变，阅读方向稿件位移取反）。
+
+### 非法参数与爬移超限（4xx）
+
+- 机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致（尺寸非正数/非有限值、
+  `duplex_flip` 或 `binding` 取值非法、含未定义字段、缺字段等）；
+- `thickness_mm` 缺失、非正数（含 `0`、负数）或非有限值（`NaN`、`Infinity`）；
+- **爬移量达到单页宽度**：任一张的爬移量 `2 × (张号 − 1) × thickness_mm` 达到或超过
+  `page_width_mm`（按十进制尺寸精确判定，含恰好相等）：返回
+  `422 Unprocessable Entity`，错误信息指出帖号与张号，例如
+  `Value error, 第 1 帖第 4 张爬移量 0.9 mm 达到单页宽度 0.9 mm，无法完成爬移补偿`。
+
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 在 `/api/v1/impose` 的基础上支持**章节感知**分帖：章节不可跨帖，相邻章节可合帖。
 本地访问地址 `http://localhost:8000/api/v1/impose/chapters`（改了 `HOST_PORT` 则对应替换端口）。
@@ -1278,7 +1415,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 订针计划 + 原纸备料）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 订针计划 + 原纸备料 + 骑马订爬移补偿）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

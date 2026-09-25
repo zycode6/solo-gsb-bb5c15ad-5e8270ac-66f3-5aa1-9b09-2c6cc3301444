@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from .imposition import (
+    creep_plan,
     impose,
     impose_chapters,
     ink_zones,
@@ -55,8 +56,12 @@ app = FastAPI(
         "按十进制尺寸精确核算整行整列排布（n 个成品加 n−1 个间隔不超过可用长度才计入 n，"
         "恰好贴边仍可排入），给出各规格单张出数，并在库存内选择总面积最小"
         "（并列再比超产、用量字典序）的原纸组合。"
+        "支持骑马订爬移补偿：沿用机台版面参数并接收单张纸厚度，按帖独立计算"
+        "（最外张位移为 0，向内第 n 张爬移量为 2×(n−1)×厚度），各页位图像向"
+        "纸面折缝中心平移，逐页位返回纸面水平位移与按 0°/180° 旋转换算的阅读方向"
+        "稿件水平位移；爬移量达到单页宽度时返回 422。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -1161,6 +1166,100 @@ class StockPlanResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# 骑马订爬移补偿 /api/v1/impose/creep-plan
+# ---------------------------------------------------------------------------
+
+
+class CreepPlanRequest(PressLayoutRequest):
+    """爬移补偿请求：机台版面全部参数 + 单张纸厚度，复用同一套校验。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thickness_mm: float = Field(
+        ..., description="单张纸厚度（mm），正数（有限值）"
+    )
+
+    @field_validator("thickness_mm")
+    @classmethod
+    def validate_thickness_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("单张纸厚度必须为正数（有限数值，单位 mm）")
+        return value
+
+    @model_validator(mode="after")
+    def validate_creep_plan(self) -> "CreepPlanRequest":
+        # 爬移量达到单页宽度时 creep_plan 抛 ValueError -> 422；
+        # 这里仅做校验，响应结果在端点内重新计算
+        creep_plan(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            duplex_flip=self.duplex_flip,
+            thickness_mm=self.thickness_mm,
+        )
+        return self
+
+
+class CreepSlot(BaseModel):
+    page: Optional[int] = Field(
+        ..., description="页码，从 1 开始；空白页位（末帖补白）为 null"
+    )
+    paper_shift_x_mm: float = Field(
+        ...,
+        description=(
+            "纸面水平位移（mm）：正=向纸面右侧、负=向纸面左侧；"
+            "左槽为正、右槽为负，均指向纸面折缝中心"
+        ),
+    )
+    artwork_shift_x_mm: float = Field(
+        ...,
+        description=(
+            "阅读方向稿件水平位移（mm）：按页位 0°/180° 旋转换算，"
+            "0° 与纸面位移相同、180° 取反"
+        ),
+    )
+
+
+class CreepPair(BaseModel):
+    left: CreepSlot = Field(..., description="左槽页位")
+    right: CreepSlot = Field(..., description="右槽页位")
+
+
+class CreepSheet(BaseModel):
+    sheet_index: int = Field(..., description="帖内纸张序号，从 1 开始（1 为最外张）")
+    creep_mm: float = Field(
+        ..., description="本张爬移量（mm）= 2 × (张号 − 1) × 单张纸厚度；最外张为 0"
+    )
+    front: CreepPair = Field(..., description="正面左右槽页位")
+    back: CreepPair = Field(..., description="背面左右槽页位")
+
+
+class CreepSignature(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_count: int = Field(..., description="本帖纸张数")
+    page_count_padded: int = Field(..., description="本帖补齐空白后的总页数（4 的倍数）")
+    sheets: list[CreepSheet] = Field(..., description="帖内纸张，按从外到内排列")
+
+
+class CreepPlanResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    thickness_mm: float
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    signature_count: int
+    signatures: list[CreepSignature]
+
+
 @app.get("/health", tags=["健康检查"])
 def health() -> dict:
     return {"status": "ok"}
@@ -1513,6 +1612,29 @@ def create_stock_plan(request: StockPlanRequest) -> StockPlanResponse:
         spacing_mm=request.spacing_mm,
     )
     return StockPlanResponse(**result)
+
+
+@app.post(
+    "/api/v1/impose/creep-plan",
+    response_model=CreepPlanResponse,
+    tags=["拼版"],
+    summary="骑马订爬移补偿：各页位图像向折缝中心的水平位移",
+    responses={
+        422: {"description": "参数非法，或某张爬移量达到单页宽度（错误信息指出帖号与张号）"},
+    },
+)
+def create_creep_plan(request: CreepPlanRequest) -> CreepPlanResponse:
+    result = creep_plan(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        thickness_mm=request.thickness_mm,
+    )
+    return CreepPlanResponse(**result)
 
 
 def _json_safe(value: object) -> object:

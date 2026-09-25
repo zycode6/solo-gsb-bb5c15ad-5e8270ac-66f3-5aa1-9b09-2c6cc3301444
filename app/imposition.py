@@ -2025,3 +2025,137 @@ def plan_stock(
         "surplus": total_production - demand,
         "total_area_mm2": total_area,
     }
+
+
+# ---------------------------------------------------------------------------
+# 骑马订爬移补偿（creep-plan）：按帖独立计算各页位图像向折缝中心的水平位移
+# ---------------------------------------------------------------------------
+
+
+def _creep_slot(placement: Optional[dict], slot: str, creep: float) -> dict:
+    """单个页位的爬移补偿结果。
+
+    左槽图像向纸面右侧平移（``+creep``）、右槽向纸面左侧平移（``−creep``），
+    均指向纸面折缝中心；阅读方向稿件位移按页位旋转角换算：0° 与纸面位移
+    相同，180° 取反。空白页位页码为 ``None``、两项位移均为 0。
+    """
+    if placement is None:
+        return {"page": None, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0}
+    if creep == 0:
+        # 最外张位移为 0：直接取 0.0，避免右槽/180° 页位出现 -0.0
+        paper_shift = 0.0
+        artwork_shift = 0.0
+    else:
+        paper_shift = creep if slot == "left" else -creep
+        artwork_shift = (
+            paper_shift if placement["rotation_deg"] == 0 else -paper_shift
+        )
+    return {
+        "page": placement["page"],
+        "paper_shift_x_mm": paper_shift,
+        "artwork_shift_x_mm": artwork_shift,
+    }
+
+
+def creep_plan(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    duplex_flip: DuplexFlip,
+    thickness_mm: float,
+) -> dict:
+    """骑马订爬移补偿：按帖独立计算各页位图像向折缝中心的水平位移。
+
+    页序、槽位与旋转规则完全沿用 :func:`press_layout`（左右装订与长/短边
+    翻转均以机台版面的实际槽位和旋转角为准）。爬移按帖独立计算：最外张
+    （张号 1）位移为 0，向内第 ``n`` 张的爬移量为
+    ``2 × (n−1) × thickness_mm``；该张正反面左右页位的图像均向纸面折缝
+    中心（纸面竖直中线）平移该量：
+
+    - 左槽（``x = 0``）：向纸面右侧平移，纸面水平位移为 ``+爬移量``；
+    - 右槽（``x = 页宽 + 中缝``）：向纸面左侧平移，纸面水平位移为 ``−爬移量``。
+
+    阅读方向稿件水平位移按页位 ``rotation_deg`` 换算：0° 与纸面位移相同，
+    180° 取反。空白页位（末帖补白）保留在结果中，页码为 ``None``、
+    两项位移均为 0。
+
+    爬移量与“达到单页宽度”的判定按**十进制尺寸**精确核算（与
+    :func:`plan_stock` 相同的十进制约定）：任一张的爬移量达到单页宽度
+    （``≥ page_width_mm``）时抛 ``ValueError``（API 层对应 422），
+    错误信息指出帖号与张号。``thickness_mm`` 必须为正有限数。
+    """
+    if (
+        not isinstance(thickness_mm, (int, float))
+        or isinstance(thickness_mm, bool)
+        or not math.isfinite(thickness_mm)
+        or thickness_mm <= 0
+    ):
+        raise ValueError("单张纸厚度 thickness_mm 必须为正数（有限数值，单位 mm）")
+
+    layout = press_layout(
+        total_pages,
+        max_sheets,
+        binding,
+        page_width_mm,
+        page_height_mm,
+        gutter_mm,
+        duplex_flip,
+    )
+    # 十进制精确核算：爬移量 = 2 × (张号 − 1) × 纸厚，
+    # 边界“达到单页宽度”不能用二进制浮点比较（如 6 × 0.15 在浮点下 < 0.9）
+    thickness_d = _to_decimal(thickness_mm)
+    page_width_d = _to_decimal(page_width_mm)
+
+    result_signatures: List[dict] = []
+    for signature in layout["signatures"]:
+        result_sheets: List[dict] = []
+        for sheet in signature["sheets"]:
+            sheet_index = sheet["sheet_index"]
+            creep_d = Decimal(2 * (sheet_index - 1)) * thickness_d
+            if creep_d >= page_width_d:
+                raise ValueError(
+                    f"第 {signature['signature_index']} 帖第 {sheet_index} 张"
+                    f"爬移量 {float(creep_d)} mm 达到单页宽度 "
+                    f"{page_width_mm} mm，无法完成爬移补偿"
+                )
+            creep = float(creep_d)
+            result_sheets.append(
+                {
+                    "sheet_index": sheet_index,
+                    "creep_mm": creep,
+                    "front": {
+                        "left": _creep_slot(sheet["front"]["left"], "left", creep),
+                        "right": _creep_slot(sheet["front"]["right"], "right", creep),
+                    },
+                    "back": {
+                        "left": _creep_slot(sheet["back"]["left"], "left", creep),
+                        "right": _creep_slot(sheet["back"]["right"], "right", creep),
+                    },
+                }
+            )
+        result_signatures.append(
+            {
+                "signature_index": signature["signature_index"],
+                "sheet_count": signature["sheet_count"],
+                "page_count_padded": signature["page_count_padded"],
+                "sheets": result_sheets,
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "duplex_flip": duplex_flip,
+        "thickness_mm": thickness_mm,
+        "paper_width_mm": layout["paper_width_mm"],
+        "paper_height_mm": layout["paper_height_mm"],
+        "signature_count": len(result_signatures),
+        "signatures": result_signatures,
+    }

@@ -775,6 +775,128 @@ def trim_safety(
     }
 
 
+# ---------------------------------------------------------------------------
+# 骑马订爬移补偿（creep-plan）：逐帖逐张给出各页位图像向折缝中心的平移量
+# ---------------------------------------------------------------------------
+
+def creep_plan(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    duplex_flip: DuplexFlip,
+    thickness_mm: float,
+) -> dict:
+    """骑马订爬移（creep）补偿：逐帖独立给出各页位图像的水平平移量。
+
+    页序、分帖、槽位（含左/右装订镜像、``long`` 背面交换槽位）与旋转
+    （``short`` 背面 180°）完全沿用 :func:`press_layout` 的结果。爬移量按
+    **帖**独立计算：帖内最外张（``sheet_index = 1``）位移为 0，向内第
+    ``n`` 张（张号从 1 开始）的爬移量为
+
+        ``creep_mm = 2 × (n − 1) × thickness_mm``
+
+    每张纸正反面左右页位上的图像一律沿纸面水平方向**向折缝中心**平移
+    ``creep_mm``：左槽页位向右平移（纸面位移 ``+creep_mm``），右槽页位
+    向左平移（纸面位移 ``−creep_mm``）。
+
+    同时给出折合成**阅读方向原稿图像**的水平位移：页位旋转 ``0°`` 时与
+    纸面位移同号；页位旋转 ``180°`` 时阅读方向 x 轴与纸面相反，位移反号。
+    位移以各自坐标系**向右为正**。
+
+    空白页位（末帖补白）保留在结果中，``page`` 为 ``None``、两项位移均为
+    0。任一帖某张的爬移量**达到单页宽度**（``creep_mm ≥ page_width_mm``）
+    时抛 ``ValueError``（API 层对应 422）；厚度非正或非有限值同样抛错。
+    """
+    if (
+        not isinstance(thickness_mm, (int, float))
+        or isinstance(thickness_mm, bool)
+        or not math.isfinite(thickness_mm)
+        or thickness_mm <= 0
+    ):
+        raise ValueError("单张纸厚度 thickness_mm 必须为正有限数值（单位 mm）")
+
+    layout = press_layout(
+        total_pages,
+        max_sheets,
+        binding,
+        page_width_mm,
+        page_height_mm,
+        gutter_mm,
+        duplex_flip,
+    )
+
+    placements: List[dict] = []
+    for signature in layout["signatures"]:
+        signature_index = signature["signature_index"]
+        for sheet in signature["sheets"]:
+            sheet_index = sheet["sheet_index"]
+            creep_mm = 2 * (sheet_index - 1) * thickness_mm
+            if creep_mm >= page_width_mm:
+                raise ValueError(
+                    f"第 {signature_index} 帖第 {sheet_index} 张的爬移量 "
+                    f"{creep_mm} mm 已达到单页宽度 {page_width_mm} mm，"
+                    "无法进行爬移补偿"
+                )
+            for side in ("front", "back"):
+                for slot in ("left", "right"):
+                    placement = sheet[side][slot]
+                    if placement is None:
+                        # 空白页位保留且位移为 0
+                        placements.append(
+                            {
+                                "signature_index": signature_index,
+                                "sheet_index": sheet_index,
+                                "side": side,
+                                "slot": slot,
+                                "page": None,
+                                "paper_shift_x_mm": 0.0,
+                                "artwork_shift_x_mm": 0.0,
+                            }
+                        )
+                        continue
+                    # 向纸面折缝中心：左槽向右（+）、右槽向左（−）；
+                    # creep=0（最外张）时归一化为 0.0，避免输出 -0.0
+                    paper_shift = creep_mm if slot == "left" else -creep_mm
+                    if paper_shift == 0:
+                        paper_shift = 0.0
+                    # 阅读方向：0° 页位与纸面同向，180° 页位反向
+                    if placement["rotation_deg"] == 180:
+                        artwork_shift = -paper_shift
+                    else:
+                        artwork_shift = paper_shift
+                    if artwork_shift == 0:
+                        artwork_shift = 0.0
+                    placements.append(
+                        {
+                            "signature_index": signature_index,
+                            "sheet_index": sheet_index,
+                            "side": side,
+                            "slot": slot,
+                            "page": placement["page"],
+                            "paper_shift_x_mm": paper_shift,
+                            "artwork_shift_x_mm": artwork_shift,
+                        }
+                    )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "duplex_flip": duplex_flip,
+        "thickness_mm": thickness_mm,
+        "paper_width_mm": layout["paper_width_mm"],
+        "paper_height_mm": layout["paper_height_mm"],
+        "signature_count": len(layout["signatures"]),
+        "placements": placements,
+    }
+
+
 def split_signatures_by_chapters(
     total_pages: int,
     max_sheets: int,

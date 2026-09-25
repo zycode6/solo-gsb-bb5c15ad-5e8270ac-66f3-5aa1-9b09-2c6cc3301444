@@ -1993,6 +1993,204 @@ def test_trim_safety_overlapping_rectangles_allowed():
 
 
 # ---------------------------------------------------------------------------
+# 骑马订爬移补偿 /api/v1/impose/creep-plan
+# ---------------------------------------------------------------------------
+
+CREEP_PLAN_BASE = {
+    "total_pages": 8,
+    "max_sheets_per_signature": 2,
+    "binding": "left",
+    "page_width_mm": 100.0,
+    "page_height_mm": 200.0,
+    "gutter_mm": 0.0,
+    "duplex_flip": "long",
+    "thickness_mm": 0.1,
+}
+
+
+def _creep_slot(data, signature_index, sheet_index, side, slot):
+    for item in data["placements"]:
+        if (
+            item["signature_index"] == signature_index
+            and item["sheet_index"] == sheet_index
+            and item["side"] == side
+            and item["slot"] == slot
+        ):
+            return item
+    raise AssertionError("未找到对应页位")
+
+
+def test_creep_plan_outermost_zero_and_inner_shifts():
+    response = client.post("/api/v1/impose/creep-plan", json=CREEP_PLAN_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["paper_width_mm"] == 200.0
+    assert data["paper_height_mm"] == 200.0
+    assert data["thickness_mm"] == 0.1
+    assert data["signature_count"] == 1
+    # 8 个页位 ×（正面/背面 × 左/右）共 8 条
+    assert len(data["placements"]) == 8
+    # 最外张（张 1）位移全为 0；正面 (8,1)
+    assert _creep_slot(data, 1, 1, "front", "left")["page"] == 8
+    assert _creep_slot(data, 1, 1, "front", "left")["paper_shift_x_mm"] == 0.0
+    assert _creep_slot(data, 1, 1, "front", "right")["page"] == 1
+    # 张 2 爬移量 0.2：左槽 +0.2（向中缝右移）、右槽 -0.2
+    fl2 = _creep_slot(data, 1, 2, "front", "left")
+    fr2 = _creep_slot(data, 1, 2, "front", "right")
+    assert fl2["page"] == 6
+    assert fl2["paper_shift_x_mm"] == 0.2
+    assert fl2["artwork_shift_x_mm"] == 0.2
+    assert fr2["page"] == 3
+    assert fr2["paper_shift_x_mm"] == -0.2
+    assert fr2["artwork_shift_x_mm"] == -0.2
+
+
+def test_creep_plan_long_back_swapped_slots():
+    # long 背面交换槽位：张 2 背面左槽 = 5、右槽 = 4
+    response = client.post("/api/v1/impose/creep-plan", json=CREEP_PLAN_BASE)
+    data = response.json()
+    bl2 = _creep_slot(data, 1, 2, "back", "left")
+    br2 = _creep_slot(data, 1, 2, "back", "right")
+    assert bl2["page"] == 5
+    assert bl2["paper_shift_x_mm"] == 0.2
+    assert br2["page"] == 4
+    assert br2["paper_shift_x_mm"] == -0.2
+    # 0° 旋转：阅读方向位移与纸面同号
+    assert bl2["artwork_shift_x_mm"] == 0.2
+    assert br2["artwork_shift_x_mm"] == -0.2
+
+
+def test_creep_plan_short_back_180_reverses_artwork():
+    body = {**CREEP_PLAN_BASE, "duplex_flip": "short", "thickness_mm": 0.25}
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    # short 背面槽位保持（背左=4、背右=5），旋转 180°，张 2 爬移量 0.5
+    bl2 = _creep_slot(data, 1, 2, "back", "left")
+    br2 = _creep_slot(data, 1, 2, "back", "right")
+    assert bl2["page"] == 4
+    assert bl2["paper_shift_x_mm"] == 0.5
+    assert bl2["artwork_shift_x_mm"] == -0.5
+    assert br2["page"] == 5
+    assert br2["paper_shift_x_mm"] == -0.5
+    assert br2["artwork_shift_x_mm"] == 0.5
+
+
+def test_creep_plan_right_binding_actual_slots():
+    body = {**CREEP_PLAN_BASE, "binding": "right"}
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    # 右装订镜像：正面 (1,6)，但左槽仍 +、右槽仍 -
+    fl2 = _creep_slot(data, 1, 2, "front", "left")
+    fr2 = _creep_slot(data, 1, 2, "front", "right")
+    assert fl2["page"] == 3
+    assert fl2["paper_shift_x_mm"] == 0.2
+    assert fr2["page"] == 6
+    assert fr2["paper_shift_x_mm"] == -0.2
+
+
+def test_creep_plan_blank_slots_preserved_zero_shift():
+    # 1 页补 3 空白：正面 (null,1)、背面 (null,null)
+    body = {
+        **CREEP_PLAN_BASE,
+        "total_pages": 1,
+        "max_sheets_per_signature": 1,
+        "duplex_flip": "short",
+    }
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    blank_left = _creep_slot(data, 1, 1, "front", "left")
+    assert blank_left["page"] is None
+    assert blank_left["paper_shift_x_mm"] == 0.0
+    assert blank_left["artwork_shift_x_mm"] == 0.0
+    assert _creep_slot(data, 1, 1, "back", "right")["page"] is None
+    # 非空页位仍正常给出位移（最外张为 0）
+    assert _creep_slot(data, 1, 1, "front", "right")["page"] == 1
+
+
+def test_creep_plan_independent_per_signature():
+    # 10 页、每帖 2 张 -> 帖 1 两张、帖 2 一张（补白后）；帖 2 唯一张爬移 0
+    body = {**CREEP_PLAN_BASE, "total_pages": 10}
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["signature_count"] == 2
+    sig2 = [
+        item for item in data["placements"]
+        if item["signature_index"] == 2
+    ]
+    assert {item["sheet_index"] for item in sig2} == {1}
+    assert all(item["paper_shift_x_mm"] == 0.0 for item in sig2)
+
+
+def test_creep_plan_reaching_page_width_returns_422():
+    # 张 2 爬移量 = 2×1×50 = 100 恰好达到页宽 100
+    body = {**CREEP_PLAN_BASE, "thickness_mm": 50.0}
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 422
+    message = response.json()["detail"][0]["msg"]
+    assert "第 1 帖第 2 张" in message
+
+
+def test_creep_plan_exceeding_page_width_returns_422():
+    body = {**CREEP_PLAN_BASE, "thickness_mm": 60.0}
+    assert client.post("/api/v1/impose/creep-plan", json=body).status_code == 422
+
+
+def test_creep_plan_just_below_page_width_ok():
+    body = {**CREEP_PLAN_BASE, "thickness_mm": 49.9995}
+    response = client.post("/api/v1/impose/creep-plan", json=body)
+    assert response.status_code == 200
+    fl2 = _creep_slot(response.json(), 1, 2, "front", "left")
+    assert fl2["paper_shift_x_mm"] == pytest.approx(99.999)
+
+
+def test_creep_plan_invalid_thickness():
+    for thickness in (0, -1, -0.5):
+        body = {**CREEP_PLAN_BASE, "thickness_mm": thickness}
+        assert client.post("/api/v1/impose/creep-plan", json=body).status_code == 422
+    for payload in (
+        '{"total_pages": 8, "max_sheets_per_signature": 2, "binding": "left", '
+        '"page_width_mm": 100, "page_height_mm": 200, "gutter_mm": 0, '
+        '"duplex_flip": "long", "thickness_mm": NaN}',
+        '{"total_pages": 8, "max_sheets_per_signature": 2, "binding": "left", '
+        '"page_width_mm": 100, "page_height_mm": 200, "gutter_mm": 0, '
+        '"duplex_flip": "long", "thickness_mm": Infinity}',
+    ):
+        response = client.post(
+            "/api/v1/impose/creep-plan",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 422
+
+
+def test_creep_plan_layout_validation_reused():
+    for override in (
+        {"page_width_mm": 0},
+        {"page_height_mm": -1},
+        {"gutter_mm": -0.5},
+        {"duplex_flip": "side"},
+        {"binding": "top"},
+        {"total_pages": 0},
+    ):
+        body = {**CREEP_PLAN_BASE, **override}
+        assert client.post("/api/v1/impose/creep-plan", json=body).status_code == 422
+
+
+def test_creep_plan_unknown_field_and_missing_field():
+    response = client.post(
+        "/api/v1/impose/creep-plan", json={**CREEP_PLAN_BASE, "extra": 1}
+    )
+    assert response.status_code == 422
+    body = dict(CREEP_PLAN_BASE)
+    del body["thickness_mm"]
+    assert client.post("/api/v1/impose/creep-plan", json=body).status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # 订针计划 /api/v1/impose/staple-plan
 # ---------------------------------------------------------------------------
 

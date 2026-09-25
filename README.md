@@ -32,6 +32,13 @@
 按外裁距离检查，**贴安全线视为合格**；逐处返回帖号、张号、正反面、页码、违规边（`top`/`bottom`/
 `outer`/`fold`）与纸面矩形，空白页跳过。
 
+还提供**骑马订爬移补偿**接口 `/api/v1/impose/creep-plan`：沿用机台版面的全部参数，另收单张纸厚度
+`thickness_mm`（正有限数）。爬移量按**帖**独立计算：最外张位移为 0，向内第 n 张爬移量为
+`2×(n−1)×thickness_mm`；每张正反面左右页位的图像均沿纸面**向折缝中心**平移该量。逐页位返回帖号、
+张号、正反面、页码、**纸面水平位移**及考虑页位 0°/180° 旋转后的**阅读方向稿件水平位移**；空白页位
+保留且位移为 0；任一帖某张爬移量达到单页宽度时返回 422。左/右装订与长边/短边翻转均以机台版面的
+实际槽位和旋转为准。
+
 还提供**双面拼版校样**接口 `/api/v1/impose/proof.pdf`：参数与机台版面完全一致，直接返回可下载的
 `proof.pdf`——每张印张依次生成正面、背面两页，纸面尺寸与机台版面一致，各页位标注页码、帖号与张号，
 空白位标注“空白”，并画出中缝分隔线；长边 / 短边翻转的背面分别按槽位交换、旋转 180° 呈现。
@@ -93,6 +100,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 瑕疵定位接口：`POST http://localhost:8000/api/v1/impose/locate-defects`
 - 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
 - 外裁/折缝安全检查接口：`POST http://localhost:8000/api/v1/impose/trim-safety`
+- 骑马订爬移补偿接口：`POST http://localhost:8000/api/v1/impose/creep-plan`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 - 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
 - 原纸备料接口：`POST http://localhost:8000/api/v1/impose/stock-plan`
@@ -617,6 +625,129 @@ curl -X POST http://localhost:8000/api/v1/impose/trim-safety \
 
 以上均返回 `422 Unprocessable Entity`。注意：**矩形越出页内是请求错误（422）**；
 矩形在页内合法、映射纸面后越过安全线则是正常的检查结果（200 + `violations`）。
+
+## 骑马订爬移补偿（POST /api/v1/impose/creep-plan）
+
+骑马订小册子折帖后，内帖页面会因纸张厚度向外凸出（creep，爬移/蠕变），需在落版时把内张页面整体向
+折缝中心平移补偿。本接口沿用**机台版面的全部参数**（分帖、左/右装订页序、`long`/`short` 翻转的槽位
+与 0°/180° 旋转完全一致），另收单张纸厚度，逐帖逐张给出每个页位图像的水平位移，用于拼版/制版端直接
+平移页面内容。本地访问地址 `http://localhost:8000/api/v1/impose/creep-plan`
+（改了 `HOST_PORT` 则对应替换端口）。
+
+### 请求
+
+`POST /api/v1/impose/creep-plan`，`Content-Type: application/json`
+
+机台版面的全部参数原样沿用（`total_pages` / `max_sheets_per_signature` / `binding` /
+`page_width_mm` / `page_height_mm` / `gutter_mm` / `duplex_flip`，约束相同），另加：
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `thickness_mm` | 数值 | 正数（有限值） | **单张纸厚度**（mm）；不接受 `0`、负数、`NaN`、`Infinity` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/creep-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 8,
+    "max_sheets_per_signature": 2,
+    "binding": "left",
+    "page_width_mm": 100,
+    "page_height_mm": 200,
+    "gutter_mm": 0,
+    "duplex_flip": "long",
+    "thickness_mm": 0.1
+  }'
+```
+
+### 爬移与位移规则
+
+- **按帖独立计算**：每个帖都从本帖最外张（`sheet_index = 1`）起算；向内第 `n` 张（张号从 1 开始，
+  1 为最外张）的爬移量为
+
+  ```
+  creep_mm = 2 × (n − 1) × thickness_mm
+  ```
+
+  最外张爬移量恒为 0（例如每张厚度 0.1 mm 时，第 2 张 0.2 mm、第 3 张 0.4 mm）。
+- **向折缝中心平移**：每张纸正反面左右页位上的图像一律沿纸面水平方向向纸面折缝中心平移
+  `creep_mm`（中缝宽度不影响爬移量）：
+  - **左槽**页位向右平移，纸面水平位移 `paper_shift_x_mm = +creep_mm`；
+  - **右槽**页位向左平移，纸面水平位移 `paper_shift_x_mm = −creep_mm`。
+- **阅读方向稿件位移** `artwork_shift_x_mm`：以页面（阅读方向）左上角为原点、向右为正，按该页位的
+  旋转角折合：
+  - 页位旋转 `0°`（正面与 `long` 背面）：阅读方向与纸面同向，位移与纸面位移**同号**；
+  - 页位旋转 `180°`（`short` 背面）：阅读方向与纸面相反，位移**反号**。
+- **实际槽位/旋转为准**：左装订 / 右装订只决定页码落在哪一个槽位（镜像交换），位移方向只看页位最终
+  所在的**实际纸面槽位**；`long` 背面按交换后的槽位给位移，`short` 背面保持槽位、按 180° 旋转反号。
+- **空白页位保留**：末帖补齐的空白页位仍在结果中给出（`slot` 与该面其他页位一致），`page` 为
+  `null`，`paper_shift_x_mm` / `artwork_shift_x_mm` 均为 `0`。
+
+### 响应
+
+顶层回显机台版面参数与 `thickness_mm`、纸面尺寸、`signature_count`；`placements` 为扁平列表，按
+帖号、张号（1 为最外张）、正反面（`front` → `back`）、左右槽（`left` → `right`）排列，每条给出：
+
+| 字段 | 说明 |
+| --- | --- |
+| `signature_index` / `sheet_index` | 帖号 / 帖内张号（均从 1 开始） |
+| `side` | 正反面：`front` / `back` |
+| `slot` | 机台版面实际纸面槽位：`left` / `right` |
+| `page` | 原稿页码；空白页位为 `null` |
+| `paper_shift_x_mm` | **纸面水平位移**（mm），纸面左上角为原点、向右为正；左槽正、右槽负 |
+| `artwork_shift_x_mm` | **阅读方向稿件水平位移**（mm），页面左上角为原点、向右为正；0° 同号、180° 反号 |
+
+上例（8 页、每帖 2 张、页宽 100、无中缝、`long`、厚度 0.1）响应：
+
+```json
+{
+  "total_pages": 8,
+  "max_sheets_per_signature": 2,
+  "binding": "left",
+  "page_width_mm": 100.0,
+  "page_height_mm": 200.0,
+  "gutter_mm": 0.0,
+  "duplex_flip": "long",
+  "thickness_mm": 0.1,
+  "paper_width_mm": 200.0,
+  "paper_height_mm": 200.0,
+  "signature_count": 1,
+  "placements": [
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "slot": "left",
+     "page": 8, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0},
+    {"signature_index": 1, "sheet_index": 1, "side": "front", "slot": "right",
+     "page": 1, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0},
+    {"signature_index": 1, "sheet_index": 1, "side": "back", "slot": "left",
+     "page": 7, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0},
+    {"signature_index": 1, "sheet_index": 1, "side": "back", "slot": "right",
+     "page": 2, "paper_shift_x_mm": 0.0, "artwork_shift_x_mm": 0.0},
+    {"signature_index": 1, "sheet_index": 2, "side": "front", "slot": "left",
+     "page": 6, "paper_shift_x_mm": 0.2, "artwork_shift_x_mm": 0.2},
+    {"signature_index": 1, "sheet_index": 2, "side": "front", "slot": "right",
+     "page": 3, "paper_shift_x_mm": -0.2, "artwork_shift_x_mm": -0.2},
+    {"signature_index": 1, "sheet_index": 2, "side": "back", "slot": "left",
+     "page": 5, "paper_shift_x_mm": 0.2, "artwork_shift_x_mm": 0.2},
+    {"signature_index": 1, "sheet_index": 2, "side": "back", "slot": "right",
+     "page": 4, "paper_shift_x_mm": -0.2, "artwork_shift_x_mm": -0.2}
+  ]
+}
+```
+
+同一请求改为 `"duplex_flip": "short"` 时，背面槽位保持（背左 = 4、背右 = 5）且旋转 180°：
+第 2 张背面左槽（第 4 页）`paper_shift_x_mm = 0.2`、`artwork_shift_x_mm = -0.2`，
+右槽（第 5 页）`paper_shift_x_mm = -0.2`、`artwork_shift_x_mm = 0.2`。
+
+### 非法参数（4xx）
+
+机台版面参数的校验与 `/api/v1/impose/press-layout` 完全一致（尺寸非正/非有限、`gutter_mm` 为负、
+`binding` / `duplex_flip` 取值非法、未定义字段等）；此外：
+
+- `thickness_mm` 不是正有限数值（`0`、负数、`NaN`、`Infinity`、缺失）；
+- **爬移量达到单页宽度**：任一帖某张 `2 × (sheet_index − 1) × thickness_mm` 达到或超过
+  `page_width_mm`；
+
+以上均返回 `422 Unprocessable Entity`，并在错误信息中指出帖号与张号，例如
+`Value error, 第 1 帖第 2 张的爬移量 100.0 mm 已达到单页宽度 100.0 mm，无法进行爬移补偿`。
 
 ## 双面拼版校样 PDF（POST /api/v1/impose/proof.pdf）
 
@@ -1278,7 +1409,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 订针计划 + 原纸备料）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 外裁/折缝安全检查 + 骑马订爬移补偿 + 订针计划 + 原纸备料）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

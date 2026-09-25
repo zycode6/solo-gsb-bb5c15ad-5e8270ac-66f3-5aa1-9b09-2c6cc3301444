@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from .imposition import (
+    creep_plan,
     impose,
     impose_chapters,
     ink_zones,
@@ -47,6 +48,9 @@ app = FastAPI(
         "支持外裁/折缝安全检查：按实际页码给出阅读方向的受保护内容矩形，映射到纸面后"
         "逐张逐面核对中缝侧折缝安全距离与其余三边外裁安全距离（贴安全线合格），"
         "逐处返回帖号/张号/正反面/页码/违规边/纸面矩形，空白页位跳过。"
+        "支持骑马订爬移补偿：按帖独立计算各张爬移量（最外张为 0、向内第 n 张为 "
+        "2×(n−1)×单张厚度），给出各页位图像向纸面折缝中心的水平位移及折合成阅读"
+        "方向原稿的水平位移（考虑页位 0°/180° 旋转），空白页位保留且位移为 0。"
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
         "支持订针计划：沿用分帖结果，在页高整数毫米刻度上避开留边与按帖禁针闭区间，"
         "以最大绝对偏差最小（并列再比偏差总和、针位字典序）为每帖规划递增订针针位。"
@@ -56,7 +60,7 @@ app = FastAPI(
         "恰好贴边仍可排入），给出各规格单张出数，并在库存内选择总面积最小"
         "（并列再比超产、用量字典序）的原纸组合。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -594,6 +598,93 @@ class TrimSafetyResponse(BaseModel):
         description=(
             "逐处越线明细，按帖号、张号、正反面、左右槽与请求矩形顺序排列；"
             "同一矩形越过多条安全线时逐边各记一条（top、bottom、outer、fold）"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 骑马订爬移补偿 /api/v1/impose/creep-plan
+# ---------------------------------------------------------------------------
+
+
+class CreepPlanRequest(PressLayoutRequest):
+    """爬移补偿请求：机台版面全部参数 + 单张纸厚度，复用同一套校验。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    thickness_mm: float = Field(
+        ..., description="单张纸厚度（mm），正有限数值"
+    )
+
+    @field_validator("thickness_mm")
+    @classmethod
+    def validate_positive_thickness(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("单张纸厚度必须为正有限数值（单位 mm）")
+        return value
+
+    @model_validator(mode="after")
+    def validate_creep_plan(self) -> "CreepPlanRequest":
+        # 爬移量达到单页宽度时 creep_plan 抛 ValueError -> 422；
+        # 这里仅做校验，响应结果在端点内重新计算
+        creep_plan(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            duplex_flip=self.duplex_flip,
+            thickness_mm=self.thickness_mm,
+        )
+        return self
+
+
+class CreepPlacement(BaseModel):
+    signature_index: int = Field(..., description="帖号，从 1 开始")
+    sheet_index: int = Field(
+        ..., description="帖内张号，从 1 开始（1 为最外张）"
+    )
+    side: Literal["front", "back"] = Field(
+        ..., description="正反面：front=正面，back=背面"
+    )
+    slot: Literal["left", "right"] = Field(
+        ..., description="纸面槽位（沿用机台版面实际槽位）：left=左槽，right=右槽"
+    )
+    page: Optional[int] = Field(..., description="原稿页码；空白页位为 null")
+    paper_shift_x_mm: float = Field(
+        ...,
+        description=(
+            "纸面水平位移（mm），以纸面左上角为原点、向右为正；"
+            "页位图像向折缝中心平移：左槽为正、右槽为负；空白页位为 0"
+        ),
+    )
+    artwork_shift_x_mm: float = Field(
+        ...,
+        description=(
+            "阅读方向原稿水平位移（mm），以页面左上角为原点、向右为正；"
+            "0° 页位与纸面位移同号，180° 页位反号；空白页位为 0"
+        ),
+    )
+
+
+class CreepPlanResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    duplex_flip: Literal["long", "short"]
+    thickness_mm: float = Field(..., description="单张纸厚度（mm）")
+    paper_width_mm: float = Field(..., description="纸面宽度（mm）= 2 × 页宽 + 中缝")
+    paper_height_mm: float = Field(..., description="纸面高度（mm）= 页高")
+    signature_count: int
+    placements: list[CreepPlacement] = Field(
+        ...,
+        description=(
+            "逐帖、逐张、正反面与左右槽的爬移位移（按帖号、张号、正反面、左右槽排列）；"
+            "空白页位保留且位移为 0"
         ),
     )
 
@@ -1302,6 +1393,29 @@ def create_trim_safety(request: TrimSafetyRequest) -> TrimSafetyResponse:
         ],
     )
     return TrimSafetyResponse(**result)
+
+
+@app.post(
+    "/api/v1/impose/creep-plan",
+    response_model=CreepPlanResponse,
+    tags=["拼版"],
+    summary="骑马订爬移补偿：逐帖逐张给出各页位向折缝中心的水平位移",
+    responses={
+        422: {"description": "参数非法，或某帖某张爬移量达到单页宽度（错误信息指出帖号、张号）"},
+    },
+)
+def create_creep_plan(request: CreepPlanRequest) -> CreepPlanResponse:
+    result = creep_plan(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        duplex_flip=request.duplex_flip,
+        thickness_mm=request.thickness_mm,
+    )
+    return CreepPlanResponse(**result)
 
 
 @app.post(
